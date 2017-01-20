@@ -111,7 +111,7 @@ def generator(z, n_hid=500, isize=28*28, reuse=False, use_bn=False):
     out = tf.nn.sigmoid(dense(hid, isize, scope='g_out', reuse=reuse))
     return out
 
-def discriminator(x, z_size, n_hid=100, isize=28*28, reuse=False):
+def discriminator(x, z_size, n_hid=500, isize=28*28, reuse=False):
     #bn1 = batch_norm(name='bn1')
     #bn2 = batch_norm(name='bn2')
     hid = dense(x, n_hid, scope='l1', reuse=reuse, normalized=True)
@@ -121,7 +121,7 @@ def discriminator(x, z_size, n_hid=100, isize=28*28, reuse=False):
     #hid = tf.nn.dropout(hid, 0.2)
     hid = tf.nn.relu(hid)
     #hid = tf.tanh(hid)
-    out = tf.nn.sigmoid(dense(hid, 1, scope='d_out', reuse=reuse))
+    out = dense(hid, 1, scope='d_out', reuse=reuse)
     return out
 
 def discriminator_from_params(x, params, isize=28*28, n_hid=100):
@@ -133,7 +133,7 @@ def discriminator_from_params(x, params, isize=28*28, n_hid=100):
     hid = dense(hid, n_hid, scope='l2', params=params[2:4], normalized=True)
     hid = tf.nn.relu(hid)
     #hid = tf.tanh(hid)
-    out = tf.nn.sigmoid(dense(hid, 1, scope='d_out', params=params[4:]))
+    out = dense(hid, 1, scope='d_out', params=params[4:])
     return out
 
 def train(loss_d, loss_g, opt_d, opt_g, data, feed_x, feed_z, z_gen, n_steps, batch_size,
@@ -156,7 +156,6 @@ def train(loss_d, loss_g, opt_d, opt_g, data, feed_x, feed_z, z_gen, n_steps, ba
             for callback in callbacks:
                 callback(t, curr_loss_d, curr_loss_g)
 
-
 g = tf.Graph()
 x_data, y_data = load_mnist()
 
@@ -166,14 +165,16 @@ x_flat = x_data.reshape((-1, 28*28))
 # set number of unrolling steps and whether to use batch norm here
 
 # This for example does not work, this also does not work when using a different optimizer (see SMORMS3 below)
-lookahead = 20
+lookahead = 5
 use_bn = False
 # but this does work (as does any setup with use_bn True)
 #lookahead = 1
 #use_bn = True
+g_lr = 0.005
+d_lr = 0.0001
 
 eps = 1e-6
-batch_size = 50
+batch_size = 128
 z_size = 100
 g_steps = 1
 d_steps = 1
@@ -191,35 +192,47 @@ with g.as_default():
             g_prior += 0. * tf.reduce_sum(tf.square(param))
 
     with tf.variable_scope('D') as scope:
-        disc_out = discriminator(tf.concat(0, [x_tf,x_gen]), z_size)
+        disc_out = discriminator(tf.concat_v2([x_tf,x_gen], 0), z_size)
         disc_real = disc_out[:batch_size, :]
         disc_fake = disc_out[batch_size:, :]
         d_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope.name)
 
-    loss_d = tf.reduce_mean(-tf.log(disc_real + eps) - tf.log(1 - disc_fake + eps))
+    loss_d = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=tf.concat_v2([disc_real, disc_fake], 0),
+                                                                    labels=tf.concat_v2([tf.ones_like(disc_real),
+                                                                                tf.zeros_like(disc_fake)], 0)))
+
 
     # select optimizer for d
-    optimizer_d = Momentum(learning_rate=1e-3, mdecay=0.5)
-    #optimizer_d = SMORMS3(learning_rate=1e-4)
+    #optimizer_d = Momentum(learning_rate=1e-3, mdecay=0.5)
+    optimizer_d = SMORMS3(learning_rate=d_lr)
     opt_d = optimizer_d.minimize(loss_d, var_list=d_params)
 
     # unroll optimizer for G
     opt_vars = None
     next_d_params = d_params
-    for i in range(lookahead):
-        disc_out_g = discriminator_from_params(tf.concat(0, [x_tf, x_gen]), next_d_params)
-        disc_real_g = disc_out_g[:batch_size, :]
+    if lookahead > 0:
+        for i in range(lookahead):
+            disc_out_g = discriminator_from_params(tf.concat_v2([x_tf, x_gen], 0), next_d_params)
+            disc_real_g = disc_out_g[:batch_size, :]
+            disc_fake_g = disc_out_g[batch_size:, :]
+            loss_d_tmp = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=tf.concat_v2([disc_real_g, disc_fake_g], 0),
+                                                                                labels=tf.concat_v2([tf.ones_like(disc_real_g),
+                                                                                          tf.zeros_like(disc_fake_g)], 0)))
+
+            grads = tf.gradients(loss_d_tmp, next_d_params)
+            next_d_params, opt_vars = optimizer_d.unroll_step(grads, next_d_params, opt_vars=opt_vars)
+    else:
+        disc_out_g = discriminator_from_params(tf.concat_v2([x_tf, x_gen], 0), next_d_params)
         disc_fake_g = disc_out_g[batch_size:, :]
-        loss_d_tmp = tf.reduce_mean(-tf.log(disc_real_g + eps) - tf.log(1 - disc_fake_g + eps))
-        grads = tf.gradients(loss_d_tmp, next_d_params)
-        next_d_params, opt_vars = optimizer_d.unroll_step(grads, next_d_params, opt_vars=opt_vars)
     #disc_out_g = discriminator_from_params(x_gen, next_d_params)
     #disc_fake_g = disc_out_g[batch_size:, :]
-    loss_g = tf.reduce_mean(-tf.log(disc_fake_g + eps))
+    loss_g = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_fake_g, labels=tf.ones_like(disc_fake_g)))
+
     
     loss_generator = loss_g
-    optimizer_g = Momentum(learning_rate=1e-2, mdecay=0.5)
-    #optimizer_g = SMORMS3(learning_rate=1e-4)
+    #optimizer_g = Momentum(learning_rate=1e-2, mdecay=0.5)
+    optimizer_g = SMORMS3(learning_rate=g_lr)
+
     opt_g = optimizer_g.minimize(loss_generator, var_list=g_params)
 
     session = tf.Session()
